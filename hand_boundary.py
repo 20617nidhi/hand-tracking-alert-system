@@ -1,186 +1,171 @@
-# hand_boundary_poc.py
-# Prototype: Hand boundary alert system (classical CV, no MediaPipe/OpenPose)
-# Requirements: opencv-python, numpy
-# Run: python hand_boundary_poc.py
-
+# hand_boundary.py
+from config import BOUND_LEFT, BOUND_RIGHT, BOUND_TOP, BOUND_BOTTOM, FRAME_WIDTH, FRAME_HEIGHT, SAVE_VIDEO, VIDEO_OUT
 import cv2
 import numpy as np
 import time
-import math
 
-# -------------- Parameters (tune these) --------------
+# ----------------- CONFIG ----------------
+BOUND_LEFT = 200
+BOUND_RIGHT = 440
+BOUND_TOP = 120
+BOUND_BOTTOM = 360
+
+SAVE_VIDEO = False       # Set True to save demo video to file
+VIDEO_OUT = "demo_output.avi"
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-# skin color HSV range (works reasonably well for many lighting conditions; tune if needed)
-LOWER_HSV = np.array([0, 30, 60])    # lower bound for skin
-UPPER_HSV = np.array([25, 255, 255]) # upper bound for skin
+# ------------------------------------------
 
-# morphological ops
-KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-
-# Virtual boundary rectangle coordinates (x1,y1) top-left, (x2,y2) bottom-right
-# You can change these to any object/shape
-rect_w, rect_h = int(FRAME_WIDTH * 0.4), int(FRAME_HEIGHT * 0.3)
-rect_x1 = (FRAME_WIDTH - rect_w) // 2
-rect_y1 = (FRAME_HEIGHT - rect_h) // 2
-rect_x2 = rect_x1 + rect_w
-rect_y2 = rect_y1 + rect_h
-
-# distance thresholds expressed as fraction of frame diagonal
-FRAME_DIAG = math.hypot(FRAME_WIDTH, FRAME_HEIGHT)
-DANGER_THRESH = 0.06 * FRAME_DIAG   # closer than this => DANGER
-WARNING_THRESH = 0.18 * FRAME_DIAG  # closer than this => WARNING (but > danger)
-
-# smoothing for fingertip position (for stable visualization)
-ALPHA = 0.6
-
-# ------------------------------------------------------
-
-def distance_point_to_rect(px, py, x1, y1, x2, y2):
-    """Euclidean distance from point to rectangle (0 if inside)."""
-    dx = max(x1 - px, 0, px - x2)
-    dy = max(y1 - py, 0, py - y2)
-    return math.hypot(dx, dy)
-
-def find_largest_contour(mask):
+def get_hand_contour(mask):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < 1000:
-        return None
-    return largest
+    return max(contours, key=cv2.contourArea)
 
-def contour_farthest_point_from_centroid(cnt):
-    M = cv2.moments(cnt)
-    if M["m00"] == 0:
-        return None
-    cx = int(M["m10"] / M["m00"])
-    cy = int(M["m01"] / M["m00"])
-    # find contour point with maximum distance from centroid
-    pts = cnt.reshape(-1, 2)
-    dists = np.linalg.norm(pts - np.array([cx, cy]), axis=1)
-    idx = np.argmax(dists)
-    fx, fy = pts[idx]
-    return (fx, fy), (cx, cy)
-
-def preprocess_frame(frame):
-    # resize & blur
+# Adjusted thresholds for SAFE/WARNING/DANGER
+def classify_state(dist):
+    if dist > 40:        # green
+        return "SAFE", (0, 255, 0)
+    elif dist > 20:      # yellow
+        return "WARNING", (0, 255, 255)
+    else:                # red
+        return "DANGER DANGER", (0, 0, 255)
+def process_frame(frame):
+    """Take a frame and return processed frame with overlay"""
+    frame = cv2.flip(frame, 1)
     frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
-    blur = cv2.GaussianBlur(frame, (5, 5), 0)
-    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-    # skin mask
-    mask = cv2.inRange(hsv, LOWER_HSV, UPPER_HSV)
-    # morphological cleaning
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, KERNEL, iterations=2)
+
+    # Skin segmentation
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    cr = ycrcb[:, :, 1]
+    mask = cv2.inRange(cr, 135, 180)
     mask = cv2.GaussianBlur(mask, (7, 7), 0)
-    return mask
+    _, mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
+
+    hand = get_hand_contour(mask)
+
+    state_text = "NO HAND DETECTED"
+    color = (255, 255, 255)
+
+    if hand is not None and cv2.contourArea(hand) > 2000:
+        M = cv2.moments(hand)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+
+            if BOUND_LEFT < cx < BOUND_RIGHT and BOUND_TOP < cy < BOUND_BOTTOM:
+                cv2.drawContours(frame, [hand], -1, (255, 0, 0), 2)
+                cv2.circle(frame, (cx, cy), 6, (0, 0, 255), -1)
+
+                dist_left = BOUND_LEFT - cx if cx < BOUND_LEFT else cx - BOUND_LEFT
+                dist_right = cx - BOUND_RIGHT if cx > BOUND_RIGHT else BOUND_RIGHT - cx
+                dist_top = BOUND_TOP - cy if cy < BOUND_TOP else cy - BOUND_TOP
+                dist_bottom = cy - BOUND_BOTTOM if cy > BOUND_BOTTOM else BOUND_BOTTOM - cy
+
+                min_dist = min(abs(dist_left), abs(dist_right), abs(dist_top), abs(dist_bottom))
+                state_text, color = classify_state(min_dist)
+
+    # Draw boundary and state
+    cv2.rectangle(frame, (BOUND_LEFT, BOUND_TOP), (BOUND_RIGHT, BOUND_BOTTOM), (255, 255, 255), 2)
+    cv2.putText(frame, state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
+
+    return frame
+
 
 def main():
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # windows: use CAP_DSHOW for less lag
-    if not cap.isOpened():
-        print("ERROR: Could not open webcam.")
-        return
+    global SAVE_VIDEO
 
-    # Set camera resolution if supported
+    cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-    prev_tip = None
-    prev_time = time.time()
-    fps = 0.0
+    if not cap.isOpened():
+        print("ERROR: Cannot open webcam. Make sure it’s not used by another application.")
+        input("Press Enter to exit...")
+        return
+
+    writer = None
+    if SAVE_VIDEO:
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        writer = cv2.VideoWriter(VIDEO_OUT, fourcc, 20.0, (FRAME_WIDTH, FRAME_HEIGHT))
+
+    prev = time.time()
+    fps = 0
+    frame_count = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        mask = preprocess_frame(frame)
+        frame = cv2.flip(frame, 1)
+        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
-        cnt = find_largest_contour(mask)
-        fingertip = None
-        centroid = None
+        # Skin segmentation (YCrCb)
+        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        cr = ycrcb[:, :, 1]
+        mask = cv2.inRange(cr, 135, 180)
+        mask = cv2.GaussianBlur(mask, (7, 7), 0)
+        _, mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
 
-        if cnt is not None:
-            res = contour_farthest_point_from_centroid(cnt)
-            if res is not None:
-                (fx, fy), (cx, cy) = res
-                fingertip = (int(fx), int(fy))
-                centroid = (int(cx), int(cy))
-                # smoothing
-                if prev_tip is None:
-                    smoothed = fingertip
-                else:
-                    sx = int(ALPHA * fingertip[0] + (1 - ALPHA) * prev_tip[0])
-                    sy = int(ALPHA * fingertip[1] + (1 - ALPHA) * prev_tip[1])
-                    smoothed = (sx, sy)
-                prev_tip = smoothed
-        else:
-            prev_tip = None
+        hand = get_hand_contour(mask)
 
-        # draw virtual rectangle
-        vis = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT)).copy()
-        cv2.rectangle(vis, (rect_x1, rect_y1), (rect_x2, rect_y2), (200, 200, 200), 2)
+        state_text = "NO HAND DETECTED"
+        color = (255, 255, 255)
 
-        # compute distance and state
-        state = "NO HAND"
-        color = (200, 200, 200)
-        dist_px = None
-        if prev_tip is not None:
-            px, py = prev_tip
-            dist_px = distance_point_to_rect(px, py, rect_x1, rect_y1, rect_x2, rect_y2)
-            if dist_px <= DANGER_THRESH:
-                state = "DANGER"
-                color = (0, 0, 255)  # red
-            elif dist_px <= WARNING_THRESH:
-                state = "WARNING"
-                color = (0, 165, 255)  # orange
-            else:
-                state = "SAFE"
-                color = (0, 255, 0)  # green
-            # draw fingertip and connecting line
-            cv2.circle(vis, (px, py), 8, color, -1)
-            # nearest point on rectangle for visualization
-            nearest_x = min(max(px, rect_x1), rect_x2)
-            nearest_y = min(max(py, rect_y1), rect_y2)
-            cv2.line(vis, (px, py), (nearest_x, nearest_y), color, 2)
-            cv2.circle(vis, (nearest_x, nearest_y), 6, color, -1)
+        if hand is not None and cv2.contourArea(hand) > 2000:
+            M = cv2.moments(hand)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
 
-            # draw contour and centroid for debug
-            cv2.drawContours(vis, [cnt], -1, (255, 0, 255), 1)
-            if centroid is not None:
-                cv2.circle(vis, centroid, 4, (255, 0, 0), -1)
+                # Only consider hand **inside the rectangle**
+                if BOUND_LEFT < cx < BOUND_RIGHT and BOUND_TOP < cy < BOUND_BOTTOM:
+                    cv2.drawContours(frame, [hand], -1, (255, 0, 0), 2)
+                    cv2.circle(frame, (cx, cy), 6, (0, 0, 255), -1)
 
-        # show state overlay
-        overlay_text = f"State: {state}"
-        cv2.putText(vis, overlay_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                    # distances to rectangle boundary
+                    dist_left = BOUND_LEFT - cx if cx < BOUND_LEFT else cx - BOUND_LEFT
+                    dist_right = cx - BOUND_RIGHT if cx > BOUND_RIGHT else BOUND_RIGHT - cx
+                    dist_top = BOUND_TOP - cy if cy < BOUND_TOP else cy - BOUND_TOP
+                    dist_bottom = cy - BOUND_BOTTOM if cy > BOUND_BOTTOM else BOUND_BOTTOM - cy
 
-        if state == "DANGER":
-            # big warning
-            cv2.putText(vis, "DANGER DANGER", (int(FRAME_WIDTH*0.15), int(FRAME_HEIGHT*0.55)),
-                        cv2.FONT_HERSHEY_DUPLEX, 2.0, (0, 0, 255), 4)
+                    min_dist = min(abs(dist_left), abs(dist_right), abs(dist_top), abs(dist_bottom))
+                    state_text, color = classify_state(min_dist)
 
-        # FPS calc
-        now = time.time()
-        dt = now - prev_time
-        prev_time = now
-        if dt > 0:
-            fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else 1.0 / dt
-        cv2.putText(vis, f"FPS: {fps:.1f}", (10, FRAME_HEIGHT-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+        # Draw virtual boundary
+        cv2.rectangle(frame, (BOUND_LEFT, BOUND_TOP), (BOUND_RIGHT, BOUND_BOTTOM), (255, 255, 255), 2)
 
-        # show mask small window for debugging
-        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        combined = np.hstack((cv2.resize(vis, (FRAME_WIDTH, FRAME_HEIGHT)), cv2.resize(mask_bgr, (FRAME_WIDTH, FRAME_HEIGHT))))
-        # show only main view (uncomment to show combined)
-        cv2.imshow("Hand Boundary Alert - Live", vis)
+        # Draw state and FPS
+        cv2.putText(frame, state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
+
+        # FPS calculation
+        frame_count += 1
+        if frame_count >= 10:
+            now = time.time()
+            fps = frame_count / (now - prev)
+            prev = now
+            frame_count = 0
+        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 2)
+
+        cv2.imshow("Hand Tracking Boundary System", frame)
+        # cv2.imshow("Mask", mask)  # optional debug
+
+        if SAVE_VIDEO and writer is not None:
+            writer.write(frame)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == 27:  # ESC to exit
+        if key == 27:  # ESC
             break
+        if key == ord('s'):  # toggle save
+            SAVE_VIDEO = not SAVE_VIDEO
 
     cap.release()
+    if writer is not None:
+        writer.release()
     cv2.destroyAllWindows()
 
-if __name__ == "__main__":
-    main()
+#if __name__ == "__main__":
+  #  main()
