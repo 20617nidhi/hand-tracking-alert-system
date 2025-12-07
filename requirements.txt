@@ -1,8 +1,5 @@
 streamlit
 streamlit-webrtc
+av
 opencv-python-headless
 numpy
-av
-pip freeze > requirements.txt
-
-
