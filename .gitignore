@@ -28,3 +28,4 @@ build/
 
 # Ignore secrets or config files
 *.env
+"venv/" 
